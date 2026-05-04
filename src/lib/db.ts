@@ -20,7 +20,13 @@ export const db = new RotaDB()
 
 export async function getSettings(): Promise<AppSettings> {
   const s = await db.settings.get('settings')
-  return s ?? { key: 'settings', apiKey: '', myName: '' }
+  return s ?? { 
+    key: 'settings', 
+    apiKey: '', 
+    geminiApiKey: '', 
+    aiProvider: 'groq', 
+    myName: '' 
+  }
 }
 
 export async function saveSettings(patch: Partial<AppSettings>) {

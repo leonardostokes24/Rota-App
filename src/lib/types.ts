@@ -19,13 +19,28 @@ export type Shift = z.infer<typeof ShiftSchema>
 export type Rota = z.infer<typeof RotaSchema>
 
 // ---- App-only entities ----
-
 export interface Person {
   id?: number
   name: string
   isMe?: boolean
   createdAt: number
 }
+
+export interface SavedRota {
+  id?: number
+  weekOf: string
+  shifts: Shift[]
+  createdAt: number
+}
+
+export interface AppSettings {
+  key: 'settings'
+  apiKey: string // Groq API Key
+  geminiApiKey: string
+  aiProvider: 'groq' | 'gemini'
+  myName: string
+}
+
 
 export interface SavedRota {
   id?: number

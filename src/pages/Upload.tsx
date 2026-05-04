@@ -20,33 +20,32 @@ export function Upload({ onDone }: { onDone: () => void }) {
     setStatus('reading')
     setStatusText('Reading spreadsheet…')
     try {
-      const settings = await getSettings()
-      if (!settings.apiKey) {
-        throw new Error('Add your Groq API key in Settings first.')
-      }
-      const { csv, markdown } = await readSpreadsheet(file)
-      setStatus('parsing')
-      setStatusText('Asking Groq to parse the rota…')
-      const todayISO = new Date().toISOString().slice(0, 10)
-      // Pull team names so the AI knows what to look for — big quality boost.
-      const team = await db.people.toArray()
-      const knownNames = team.map((p) => p.name)
-      const rota = await parseRotaWithAI({
-        apiKey: settings.apiKey,
-        csv,
-        markdown,
-        todayISO,
-        knownNames,
-        onStatus: setStatusText
-      })
-      // Auto-save immediately so navigating away can't lose the work.
-      await db.rotas.add({
-        weekOf: rota.weekOf,
-        shifts: rota.shifts,
-        createdAt: Date.now()
-      })
-      setPreview(rota)
-      setStatus('preview')
+       const settings = await getSettings()
+       if (settings.aiProvider === 'groq' && !settings.apiKey) {
+         throw new Error('Add your Groq API key in Settings first.')
+       }
+       if (settings.aiProvider === 'gemini' && !settings.geminiApiKey) {
+         throw new Error('Add your Gemini API key in Settings first.')
+       }
+       const { csv, markdown, sparseCsv } = await readSpreadsheet(file)
+       setStatus('parsing')
+       setStatusText('Asking AI to parse the rota…')
+       const todayISO = new Date().toISOString().slice(0, 10)
+       // Pull team names so the AI knows what to look for — big quality boost.
+       const team = await db.people.toArray()
+       const knownNames = team.map((p) => p.name)
+       const rota = await parseRotaWithAI({
+         apiKey: settings.apiKey,
+         geminiApiKey: settings.geminiApiKey,
+         aiProvider: settings.aiProvider,
+         csv,
+         markdown,
+         sparseCsv,
+         todayISO,
+         knownNames,
+         onStatus: setStatusText
+       })
+
     } catch (e) {
       console.error('[upload] failed:', e)
       setError(e instanceof Error ? e.message : String(e))

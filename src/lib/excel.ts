@@ -6,10 +6,11 @@ import * as XLSX from 'xlsx'
  *  - csv: CSV string (compact, decent for AI input)
  *  - markdown: rendered grid with row/column markers — easier for LLMs to
  *    track names that span columns or rows in messy rotas
+ *  - sparseCsv: highly compressed format (row,col,value) for large, sparse files
  */
 export async function readSpreadsheet(
   file: File
-): Promise<{ rows: string[][]; csv: string; markdown: string }> {
+): Promise<{ rows: string[][]; csv: string; markdown: string; sparseCsv: string }> {
   const buf = await file.arrayBuffer()
   const wb = XLSX.read(buf, { type: 'array', cellDates: true })
   const firstSheetName = wb.SheetNames[0]
@@ -22,34 +23,58 @@ export async function readSpreadsheet(
     defval: ''
   }) as string[][]
 
-  const rows = trimEmptyEdges(rawRows)
+  const rows = trimEmptyRowsAndColumns(rawRows)
   const csv = rowsToCsv(rows)
   const markdown = renderMarkdownGrid(rows)
-  return { rows, csv, markdown }
+  const sparseCsv = toSparseCsv(rows)
+  return { rows, csv, markdown, sparseCsv }
 }
 
-/** Drop trailing/leading fully-empty rows and columns to keep the prompt small. */
-function trimEmptyEdges(rows: string[][]): string[][] {
+/** Removes all completely empty rows and columns to minimize token usage. */
+function trimEmptyRowsAndColumns(rows: string[][]): string[][] {
   if (rows.length === 0) return rows
+
   const isEmpty = (v: unknown) => v === undefined || v === null || String(v).trim() === ''
 
-  // Trim leading & trailing empty rows
-  let top = 0
-  let bottom = rows.length - 1
-  while (top <= bottom && rows[top].every(isEmpty)) top++
-  while (bottom >= top && rows[bottom].every(isEmpty)) bottom--
-  const sliced = rows.slice(top, bottom + 1).map((r) => r.map((c) => String(c).trim()))
+  // 1. Remove empty rows
+  let cleanedRows = rows.filter((row) => !row.every(isEmpty))
 
-  if (sliced.length === 0) return sliced
-  const maxCols = Math.max(...sliced.map((r) => r.length))
+  if (cleanedRows.length === 0) return []
 
-  // Find leading & trailing empty columns
-  let left = 0
-  let right = maxCols - 1
-  while (left <= right && sliced.every((r) => isEmpty(r[left]))) left++
-  while (right >= left && sliced.every((r) => isEmpty(r[right]))) right--
+  // 2. Remove empty columns
+  const maxCols = Math.max(...cleanedRows.map((r) => r.length))
+  const nonEmptyColIndices = new Set<number>()
 
-  return sliced.map((r) => r.slice(left, right + 1))
+  for (const row of cleanedRows) {
+    for (let colIndex = 0; colIndex < row.length; colIndex++) {
+      if (!isEmpty(row[colIndex])) {
+        nonEmptyColIndices.add(colIndex)
+      }
+    }
+  }
+
+  // Sort indices to ensure we keep them in order
+  const sortedColIndices = Array.from(nonEmptyColIndices).sort((a, b) => a - b)
+
+  return cleanedRows.map((row) =>
+    sortedColIndices.map((colIndex) => String(row[colIndex] ?? '').trim())
+  )
+}
+
+/** Highly compressed format for large sparse spreadsheets. Format: row,col,value */
+function toSparseCsv(rows: string[][]): string {
+  const entries: string[] = []
+  for (let r = 0; r < rows.length; r++) {
+    for (let c = 0; c < rows[r].length; c++) {
+      const val = rows[r][c].trim()
+      if (val !== '') {
+        // Escape commas in values
+        const escapedVal = val.includes(',') ? `"${val.replace(/"/g, '""')}"` : val
+        entries.push(`${r},${c},${escapedVal}`)
+      }
+    }
+  }
+  return entries.join('\n')
 }
 
 function rowsToCsv(rows: string[][]): string {

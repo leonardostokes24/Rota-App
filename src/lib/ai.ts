@@ -5,12 +5,10 @@ import { RotaSchema, type Rota } from './types'
 // Get a key: https://console.groq.com/keys
 //
 // Tried in order if a model is overloaded or rate-limited.
-// llama-3.3-70b is best quality but has only 12k TPM on the free tier;
-// gemma2-9b has higher TPM (15k) so we fall to it on 413/429-tpm.
 const MODEL_FALLBACKS = [
   'llama-3.3-70b-versatile',
-  'gemma2-9b-it',
-  'llama-3.1-8b-instant'
+  'llama-3.1-8b-instant',
+  'openai/gpt-oss-20b'
 ]
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -18,39 +16,44 @@ const RETRYABLE_HTTP = [429, 500, 502, 503, 504]
 const PER_ATTEMPT_TIMEOUT_MS = 45_000
 const MAX_TOKENS = 8000
 
-// Tighter prompt — removes verbose explanations while keeping the rules
-// that prevent the model from missing names or truncating output.
 const SYSTEM_PROMPT = `You convert work-rota spreadsheets into structured JSON.
 
-Rotas appear as: a grid (names down, days across), a transposed grid (days down, names across), a list (one shift per row), or stacked sub-tables.
+Your primary goal is to correctly identify the layout (style) of the rota and extract every single shift without exception.
 
-Return ONE JSON object, no prose, no code fences:
+Return ONLY a JSON object. No prose, no markdown code fences.
 {
-  "weekOf": "YYYY-MM-DD",
+  "weekOf": "YYYY-MM-DD", // The date of the Monday of the rota's week
   "shifts": [
     {"date":"YYYY-MM-DD","person":"string","start":"HH:mm","end":"HH:mm","role":"string"}
   ]
 }
 
-Rules:
-- EXHAUSTIVE: include every (person, date) shift you can find. If 8 people work, output shifts for all 8. Do not summarise or skip.
-- NAMES: identify every distinct name in the data first (including merged cells, ALL CAPS, abbreviations) before building shifts.
-- TIMES: convert all formats to 24h "HH:mm". "9-5" -> 09:00–17:00. "9am-2pm" -> 09:00–14:00. "1730" -> 17:30. Larger number is end.
-- SKIP: cells that are empty or say OFF / REST / DAY OFF / X / - / N/A.
-- DATES: if only weekdays are shown, infer the date from today's date provided below. Always return YYYY-MM-DD.
-- ROLES: text like "9-5 BAR" -> times in start/end, "BAR" in role. If no times, leave start/end "".
-- Do NOT truncate the JSON array. Prefer short role strings to cutting shifts.`
+Extraction Logic:
+1. IDENTIFY LAYOUT: Determine if it's a grid, list, or multiple tables. 
+   IMPORTANT: Rotas often use "Column Groups". A single day (e.g., Monday) might be represented by a header in one column, followed by several sub-columns (e.g., for different shifts, or for 'L' and 'D' markers). If you see a date header in a cell, the subsequent columns in that row (and those below it) likely belong to that same day until the next date header appears. Metadata rows (like sub-headers, counts, or notes) may exist between the date header and the actual shift data. Use the date header to anchor all subsequent columns to that day.
+2. ANCHOR DATES: Use 'Today's date' to determine the exact YYYY-MM-DD for each day (Mon, Tue, etc.). Ensure "weekOf" is the Monday of that week.
+3. EXHAUSTIVE SCAN: Scan every cell. If a cell corresponds to a person and a date, and it is NOT empty or a "SKIP" value, it is a SHIFT.
+
+If the input is in Sparse CSV format (row,col,value), treat each line as a single cell at the specified coordinates (e.g., '5,2,09:00' means row 5, column 2 has value '09:00').
+
+Strict Rules:
+- NO SKIPPING: Do not summarize. Do not truncate. If 10 people have shifts, extract all 10. If a person works 5 days, extract all 5.
+- SHIFT DETECTION: Any cell that isn't empty, "OFF", "REST", "X", "-", or "N/A" is a shift. Even if it just says "Working" or a role like "BAR" without times.
+- NAMES: Use 'Known team members' to help match, but include anyone who clearly has a shift.
+- TIMES: Convert to 24h "HH:mm". If no times are provided but it's a shift, leave start/end as "".
+- DATES: Convert day names (Mon, Tue) to YYYY-MM-DD.
+- OUTPUT: Valid JSON only. No "..." or "etc".`
 
 const FEW_SHOT = `Example. Input grid:
-| row | A | B | C |
-| 1 | Name | Mon | Tue |
-| 2 | Alice | 9-5 | OFF |
-| 3 | Bob | OFF | 10-6 |
+| row | A | B | C | D | E | F | G |
+| 1 | Name | Mon | | | Tue | | |
+| 2 | Alice | 09:00 | 17:00 | | 10:00 | 18:00 | |
+| 3 | Bob | | | | OFF | | |
 
-Today 2025-01-13. Output:
+Today 2025-01-13 (Monday). Output:
 {"weekOf":"2025-01-13","shifts":[
 {"date":"2025-01-13","person":"Alice","start":"09:00","end":"17:00","role":""},
-{"date":"2025-01-14","person":"Bob","start":"10:00","end":"18:00","role":""}]}`
+{"date":"2025-01-14","person":"Alice","start":"10:00","end":"18:00","role":""}]}`
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -82,8 +85,49 @@ interface GroqResponse {
   error?: { message?: string; type?: string }
 }
 
-// Rough char-to-token estimate so we can pre-emptively pick a smaller payload.
 const estTokens = (s: string) => Math.ceil(s.length / 3.7)
+
+async function callGemini(opts: {
+  apiKey: string
+  systemPrompt: string
+  userPrompt: string
+}): Promise<string> {
+  const res = await withTimeout(
+    fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${opts.apiKey}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        system_instruction: {
+          parts: [{ text: opts.systemPrompt }]
+        },
+        contents: [
+          {
+            parts: [{ text: opts.userPrompt }]
+          }
+        ],
+        generationConfig: {
+          response_mime_type: 'application/json'
+        }
+      })
+    }),
+    PER_ATTEMPT_TIMEOUT_MS
+  )
+
+  if (!res.ok) {
+    const bodyText = await res.text()
+    const err = new Error(`[${res.status}] ${res.statusText}${bodyText ? ' — ' + bodyText.slice(0, 300) : ''}`) as Error & { status?: number; bodyText?: string }
+    err.status = res.status
+    err.bodyText = bodyText
+    throw err
+  }
+
+  const json = await res.json()
+  const content = json.candidates?.[0]?.content?.parts?.[0]?.text
+  if (!content) throw new Error('Empty response from Gemini.')
+  return content
+}
 
 async function callGroq(opts: {
   apiKey: string
@@ -157,32 +201,33 @@ function buildUserPrompt(opts: {
 
 export async function parseRotaWithAI(opts: {
   apiKey: string
+  geminiApiKey?: string
+  aiProvider: 'groq' | 'gemini'
   csv: string
   markdown?: string
+  sparseCsv?: string
   todayISO: string
   knownNames?: string[]
   onStatus?: (msg: string) => void
 }): Promise<Rota> {
-  const { apiKey, csv, markdown, todayISO, knownNames, onStatus } = opts
-  if (!apiKey) throw new Error('Missing Groq API key. Add it in Settings.')
-  if (!csv.trim() && !markdown?.trim()) {
+  const { apiKey, geminiApiKey, aiProvider, csv, markdown, sparseCsv, todayISO, knownNames, onStatus } = opts
+  const activeApiKey = aiProvider === 'gemini' ? geminiApiKey : apiKey
+  if (!activeApiKey) throw new Error(`Missing ${aiProvider.toUpperCase()} API key. Add it in Settings.`)
+  if (!csv.trim() && !markdown?.trim() && !sparseCsv?.trim()) {
     throw new Error('The spreadsheet looks empty.')
   }
 
-  // Pick the most informative representation that fits comfortably below
-  // the 12k TPM ceiling of the default 70B model. Markdown grid is best
-  // for LLMs but verbose; CSV is more compact.
-  const SAFE_INPUT_TOKENS = 8000 // leaves room for system + few-shot + output
+  const SAFE_INPUT_TOKENS = 8000
   const useMarkdown = !!markdown && estTokens(markdown) <= SAFE_INPUT_TOKENS
   const includeFewShot = estTokens(SYSTEM_PROMPT) + estTokens(FEW_SHOT) < 1500
 
   type Variant = {
     label: string
     payload: string
-    payloadKind: 'markdown' | 'csv'
+    payloadKind: 'markdown' | 'csv' | 'sparseCsv'
     fewShot: boolean
   }
-  // Variants are tried left-to-right when we hit 413/TPM rate limits.
+
   const variants: Variant[] = []
   if (useMarkdown) {
     variants.push({
@@ -192,19 +237,40 @@ export async function parseRotaWithAI(opts: {
       fewShot: includeFewShot
     })
   }
-  variants.push({
-    label: 'Spreadsheet (CSV)',
-    payload: csv,
-    payloadKind: 'csv',
-    fewShot: includeFewShot
-  })
-  // Final fallback: CSV with no few-shot (smallest possible input)
+
+  if (estTokens(csv) <= SAFE_INPUT_TOKENS) {
+    variants.push({
+      label: 'Spreadsheet (CSV)',
+      payload: csv,
+      payloadKind: 'csv',
+      fewShot: includeFewShot
+    })
+  }
+
+  if (sparseCsv && estTokens(sparseCsv) <= SAFE_INPUT_TOKENS) {
+    variants.push({
+      label: 'Spreadsheet (Sparse CSV)',
+      payload: sparseCsv,
+      payloadKind: 'sparseCsv',
+      fewShot: includeFewShot
+    })
+  }
+
   variants.push({
     label: 'Spreadsheet (CSV)',
     payload: csv,
     payloadKind: 'csv',
     fewShot: false
   })
+
+  if (sparseCsv) {
+    variants.push({
+      label: 'Spreadsheet (Sparse CSV)',
+      payload: sparseCsv,
+      payloadKind: 'sparseCsv',
+      fewShot: false
+    })
+  }
 
   let lastErr: unknown = null
 
@@ -221,16 +287,22 @@ export async function parseRotaWithAI(opts: {
         includeFewShot: variant.fewShot
       })
 
-      onStatus?.(`Asking ${modelName.split('-')[0]}…`)
+      onStatus?.(`Asking ${aiProvider === 'gemini' ? 'Gemini' : modelName.split('-')[0]}…`)
 
       try {
         const text = (
-          await callGroq({
-            apiKey,
-            model: modelName,
-            systemPrompt: SYSTEM_PROMPT,
-            userPrompt
-          })
+          aiProvider === 'gemini'
+            ? await callGemini({
+                apiKey: activeApiKey,
+                systemPrompt: SYSTEM_PROMPT,
+                userPrompt
+              })
+            : await callGroq({
+                apiKey: activeApiKey,
+                model: modelName,
+                systemPrompt: SYSTEM_PROMPT,
+                userPrompt
+              })
         ).trim()
 
         let parsed: unknown
@@ -247,14 +319,14 @@ export async function parseRotaWithAI(opts: {
           )
         }
         console.info(
-          `[ai] ${modelName} (${variant.payloadKind}${variant.fewShot ? '+fs' : ''}) ` +
+          `[ai] ${aiProvider === 'gemini' ? 'Gemini' : modelName} (${variant.payloadKind}${variant.fewShot ? '+fs' : ''}) ` +
             `returned ${validated.data.shifts.length} shifts ` +
             `across ${new Set(validated.data.shifts.map((s) => s.person.toLowerCase())).size} people.`
         )
         return validated.data
       } catch (err) {
         console.error(
-          `[ai] ${modelName} (${variant.payloadKind}${variant.fewShot ? '+fs' : ''}) failed:`,
+          `[ai] ${aiProvider === 'gemini' ? 'Gemini' : modelName} (${variant.payloadKind}${variant.fewShot ? '+fs' : ''}) failed:`,
           err
         )
         lastErr = err
@@ -264,26 +336,30 @@ export async function parseRotaWithAI(opts: {
           status === 413 ||
           /tokens per minute|TPM|too large|context_length/i.test(body)
 
-        // Too big? Try a smaller variant (CSV → CSV without few-shot).
         if (isTooLarge && v < variants.length - 1) {
           onStatus?.('Rota is large — trying a smaller payload…')
           continue
         }
 
-        // Other transient errors — switch model.
         const retryable = status != null && RETRYABLE_HTTP.includes(status)
         if (retryable && m < MODEL_FALLBACKS.length - 1) {
-          onStatus?.(`${modelName} busy, switching model…`)
-          break // breaks the variant loop, outer loop advances to next model
+          onStatus?.(`${aiProvider === 'gemini' ? 'Gemini' : modelName} busy, switching model…`)
+          break
         }
 
-        // We've exhausted reasonable retries on this attempt.
         throw friendlyError(err, status)
       }
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error('Groq call failed.')
+  throw lastErr instanceof Error ? lastErr : new Error('AI call failed.')
 }
+
+interface GroqResponse {
+  choices?: { message?: { content?: string } }[]
+  error?: { message?: string; type?: string }
+}
+
+const estTokens = (s: string) => Math.ceil(s.length / 3.7)
 
 function friendlyError(err: unknown, status: number | null): Error {
   if (status === 401 || status === 403) {
