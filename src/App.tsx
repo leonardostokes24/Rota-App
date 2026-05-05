@@ -4,6 +4,7 @@ import { Upload } from './pages/Upload'
 import { Team } from './pages/Team'
 import { Settings } from './pages/Settings'
 import { BottomNav, type Tab } from './components/BottomNav'
+import { BonziBuddy } from './components/BonziBuddy'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('home')
@@ -17,6 +18,7 @@ export default function App() {
         {tab === 'settings' && <Settings />}
       </main>
       <BottomNav current={tab} onChange={setTab} />
+      <BonziBuddy />
     </div>
   )
 }

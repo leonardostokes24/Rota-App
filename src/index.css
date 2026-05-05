@@ -16,3 +16,12 @@ body {
 input, select, textarea, button {
   font-size: 16px; /* prevents iOS zoom on focus */
 }
+
+@keyframes bonzi-float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-20px); }
+}
+
+.animate-bonzi {
+  animation: bonzi-float 3s ease-in-out infinite;
+}

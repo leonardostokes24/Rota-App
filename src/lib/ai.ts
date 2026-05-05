@@ -359,8 +359,6 @@ interface GroqResponse {
   error?: { message?: string; type?: string }
 }
 
-const estTokens = (s: string) => Math.ceil(s.length / 3.7)
-
 function friendlyError(err: unknown, status: number | null): Error {
   if (status === 401 || status === 403) {
     return new Error(
